@@ -2,54 +2,80 @@ name: Canadian News Daily Digest
 
 on:
   schedule:
-    # GitHub Actions cron is UTC-only and can't express "7:00 AM America/New_York"
-    # directly, since that shifts between 11:00 UTC (EDT, roughly mid-March to
-    # early November) and 12:00 UTC (EST, the rest of the year). So this job
-    # fires at BOTH times every day, and the "Check local time" step below
-    # exits early on whichever run doesn't actually correspond to 7:00 AM
-    # America/New_York -- effectively auto-switching for daylight saving.
-    - cron: "0 11 * * *" # candidate run: 7:00 AM EDT
-    - cron: "0 12 * * *" # candidate run: 7:00 AM EST
-  workflow_dispatch: {} # lets you trigger a run manually from the Actions tab (always runs, bypasses the time check)
+    - cron: "*/30 10-17 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
   send-digest:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Check local time (America/New_York)
-        id: time_check
-        run: |
-          HOUR=$(TZ="America/New_York" date +%H)
-          echo "Current hour in America/New_York: $HOUR"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-          elif [ "$HOUR" = "07" ]; then
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping -- this scheduled trigger does not correspond to 7:00 AM America/New_York today."
-          fi
-
       - name: Check out repository
-        if: steps.time_check.outputs.should_run == 'true'
         uses: actions/checkout@v4
 
+      - name: Decide whether to run
+        id: gate
+        run: |
+          TODAY=$(TZ="America/New_York" date +%Y-%m-%d)
+          HOUR=$(TZ="America/New_York" date +%H)
+          echo "Today (America/New_York): $TODAY, hour: $HOUR"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger -- always running (does not update the daily marker)."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "update_marker=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$HOUR" -lt 7 ]; then
+            echo "Before 7 AM local time -- too early, waiting for a later scheduled trigger."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LAST_SENT=""
+          if [ -f .state/last-sent.txt ]; then
+            LAST_SENT=$(cat .state/last-sent.txt)
+          fi
+
+          if [ "$LAST_SENT" = "$TODAY" ]; then
+            echo "Already sent today's digest ($TODAY) -- skipping this trigger."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Not yet sent today ($TODAY, last sent: ${LAST_SENT:-none}) -- proceeding."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "update_marker=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Node.js
-        if: steps.time_check.outputs.should_run == 'true'
+        if: steps.gate.outputs.should_run == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install dependencies
-        if: steps.time_check.outputs.should_run == 'true'
+        if: steps.gate.outputs.should_run == 'true'
         run: npm install
 
       - name: Run Canadian News AI Agent
-        if: steps.time_check.outputs.should_run == 'true'
+        if: steps.gate.outputs.should_run == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           DIGEST_RECIPIENT: ${{ secrets.DIGEST_RECIPIENT }}
         run: npm start
+
+      - name: Record today's send date
+        if: steps.gate.outputs.should_run == 'true' && steps.gate.outputs.update_marker == 'true'
+        run: |
+          mkdir -p .state
+          TZ="America/New_York" date +%Y-%m-%d > .state/last-sent.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .state/last-sent.txt
+          git commit -m "chore: record digest sent for $(cat .state/last-sent.txt)" || echo "Nothing to commit"
+          git push
